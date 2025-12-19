@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+matplotlib
+scikit-learn
+joblib
+tensorflow
+requests
+os
+datetime
+dotenv
+pickle
