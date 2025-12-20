@@ -8,78 +8,131 @@ from datetime import datetime, timedelta
 import tensorflow as tf
 from tensorflow import keras
 
-# ---------------------------
-# Paths / constants
-# ---------------------------
-HERE = Path(__file__).resolve().parent          # .../src
-REPO_ROOT = HERE.parent                         # .../congestion_zone_traffic
 
-MODEL_PATH = REPO_ROOT / "lstm_model.keras"
-SCALER_PATH = REPO_ROOT / "scaler.pkl"
+# ---------------------------
+# Basic config
+# ---------------------------
+st.set_page_config(page_title="NYC Congestion Pricing - Traffic Volume", layout="wide")
 
 COL_TIMESTAMP = "toll_timestamp"
 COL_PRED = "traffic_volume_pred"
 
-st.set_page_config(page_title="NYC Congestion Pricing - Traffic Volume", layout="wide")
-
 
 # ---------------------------
-# Artifact loading (cached)
+# Helpers: find files anywhere in repo + debug
 # ---------------------------
+HERE = Path(__file__).resolve().parent          # .../src
+REPO_ROOT = HERE.parent                         # .../congestion_zone_traffic
+
+
+def _repo_tree_preview(root: Path, max_depth: int = 4) -> str:
+    """Small tree preview for debugging what's actually in Streamlit Cloud."""
+    lines = []
+    root = root.resolve()
+    for p in sorted(root.rglob("*")):
+        try:
+            rel = p.relative_to(root)
+        except Exception:
+            rel = p
+        depth = len(rel.parts)
+        if depth > max_depth:
+            continue
+        if p.is_dir():
+            continue
+        lines.append(str(rel))
+    return "\n".join(lines[:500])  # cap output
+
+
+def find_first(root: Path, patterns: list[str]) -> Path | None:
+    """Search root recursively for the first file matching any glob pattern."""
+    for pat in patterns:
+        matches = list(root.rglob(pat))
+        if matches:
+            # prefer the shortest path (often closest to repo root)
+            matches = sorted(matches, key=lambda x: len(x.parts))
+            return matches[0]
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def resolve_artifact_paths() -> tuple[Path, Path]:
+    """
+    Finds model + scaler anywhere in the repo.
+    Tries common names/locations first, then recursive search.
+    """
+    # Common expected locations first
+    candidates_model = [
+        REPO_ROOT / "lstm_model.keras",
+        REPO_ROOT / "models" / "lstm_model.keras",
+        REPO_ROOT / "artifacts" / "lstm_model.keras",
+        HERE / "lstm_model.keras",
+        HERE / "models" / "lstm_model.keras",
+    ]
+    candidates_scaler = [
+        REPO_ROOT / "scaler.pkl",
+        REPO_ROOT / "models" / "scaler.pkl",
+        REPO_ROOT / "artifacts" / "scaler.pkl",
+        HERE / "scaler.pkl",
+        HERE / "models" / "scaler.pkl",
+    ]
+
+    model_path = next((p for p in candidates_model if p.exists()), None)
+    scaler_path = next((p for p in candidates_scaler if p.exists()), None)
+
+    # If not found, do a recursive search
+    if model_path is None:
+        model_path = find_first(REPO_ROOT, ["*.keras", "*.h5", "*.hdf5"])
+    if scaler_path is None:
+        scaler_path = find_first(REPO_ROOT, ["scaler.pkl", "*scaler*.pkl", "*.pkl"])
+
+    if model_path is None or scaler_path is None:
+        # Expose what files actually exist on the server
+        with st.expander("Debug: repo file listing (Streamlit Cloud)"):
+            st.code(_repo_tree_preview(REPO_ROOT), language="text")
+
+        missing = []
+        if model_path is None:
+            missing.append("model (.keras/.h5)")
+        if scaler_path is None:
+            missing.append("scaler (.pkl)")
+
+        raise FileNotFoundError(
+            "Could not locate required artifact(s): " + ", ".join(missing) + "\n\n"
+            "Make sure these files are committed to GitHub (and not ignored), or if using Git LFS, "
+            "ensure Streamlit Cloud can pull the real files (not pointer stubs)."
+        )
+
+    return model_path, scaler_path
+
+
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
     """Load model + scaler once per app session."""
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found at: {MODEL_PATH}")
+    model_path, scaler_path = resolve_artifact_paths()
 
-    if not SCALER_PATH.exists():
-        raise FileNotFoundError(f"Scaler file not found at: {SCALER_PATH}")
+    # show resolved paths in sidebar for sanity
+    st.session_state["resolved_model_path"] = str(model_path)
+    st.session_state["resolved_scaler_path"] = str(scaler_path)
 
-    # Inference-only load to avoid optimizer/metrics deserialization problems
+    # Inference-only load to avoid optimizer/metrics deserialization issues
     try:
-        model = keras.models.load_model(MODEL_PATH, compile=False)
-    except Exception as e1:
-        # Fallback loader
-        try:
-            model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-        except Exception as e2:
-            raise RuntimeError(
-                "Failed to load Keras model. Likely causes:\n"
-                "- Saved with custom objects (loss/metrics/layers) not available in Cloud\n"
-                "- Version mismatch between save/load environments\n\n"
-                f"keras.load_model error: {type(e1).__name__}: {e1}\n"
-                f"tf.keras.load_model error: {type(e2).__name__}: {e2}\n\n"
-                "Fix options:\n"
-                "1) Re-save model with: model.save('lstm_model.keras', include_optimizer=False)\n"
-                "2) Or re-export as SavedModel / inference-only format\n"
-                "3) Or provide custom_objects in load_model\n"
-            )
+        model = keras.models.load_model(model_path, compile=False)
+    except Exception:
+        model = tf.keras.models.load_model(model_path, compile=False)
 
-    try:
-        scaler = joblib.load(SCALER_PATH)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load scaler from {SCALER_PATH}: {type(e).__name__}: {e}")
-
+    scaler = joblib.load(scaler_path)
     return model, scaler
 
 
 # ---------------------------
-# Predictions (cached)
+# Predictions
 # ---------------------------
-@st.cache_data(show_spinner=True, ttl=60 * 10)  # cache for 10 minutes
+@st.cache_data(show_spinner=True, ttl=60 * 10)
 def get_predictions(last_n_days: int):
-    """
-    Returns:
-      pred_df_small: DataFrame with [toll_timestamp, traffic_volume_pred]
-      y_true: np.array
-      y_pred: np.array
-      mae, rmse: floats
-    """
     raw = lf.load_last_n_days_brooklyn(n_days=last_n_days)
     feat = lf.aggr_data(raw)
 
     mdl, scaler = load_artifacts()
-
     pred_df_full, mae, rmse = lf.mdl_pipe(mdl, scaler, feat, SEQ_LEN=48)
 
     pred_df_full = pred_df_full.copy()
@@ -103,7 +156,6 @@ with st.sidebar:
 
     st.divider()
     st.header("Filter View")
-
     start_date = st.date_input("Start Date", value=(datetime.now() - timedelta(days=7)).date())
     end_date = st.date_input("End date", value=datetime.now().date())
 
@@ -112,10 +164,14 @@ with st.sidebar:
     st.caption("Ranks timestamps by predicted volume (Lowest -> Highest).")
     top_n = st.slider("Show N lowest / N highest", 3, 25, 10)
 
+    st.divider()
+    st.header("Artifacts (resolved)")
+    st.caption("This is where Streamlit Cloud actually found them.")
+    st.text(st.session_state.get("resolved_model_path", "(not resolved yet)"))
+    st.text(st.session_state.get("resolved_scaler_path", "(not resolved yet)"))
 
-# ---------------------------
-# Run predictions with good error visibility
-# ---------------------------
+
+# Run predictions with clear errors
 try:
     with st.spinner("Loading data and generating predictions..."):
         pred, y_true, y_pred, mae, rmse = get_predictions(last_n_days)
@@ -123,49 +179,32 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-
-# ---------------------------
-# Timestamp normalization to NY time (robust)
-# ---------------------------
+# Normalize timestamps to NY time
 ts = pd.to_datetime(pred[COL_TIMESTAMP], errors="coerce")
 
-# If tz-aware -> convert to NY then drop tz
 if getattr(ts.dt, "tz", None) is not None:
     pred[COL_TIMESTAMP] = ts.dt.tz_convert("America/New_York").dt.tz_localize(None)
 else:
-    # If tz-naive -> assume UTC, localize then convert
     pred[COL_TIMESTAMP] = ts.dt.tz_localize("UTC").dt.tz_convert("America/New_York").dt.tz_localize(None)
-
-# Validate output
-needed = {COL_TIMESTAMP, COL_PRED}
-if not needed.issubset(pred.columns):
-    st.error(f"Prediction output must include columns: {sorted(list(needed))}")
-    st.stop()
 
 # Filter by date range
 start_dt = pd.to_datetime(start_date)
 end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-
 pred_f = pred[(pred[COL_TIMESTAMP] >= start_dt) & (pred[COL_TIMESTAMP] <= end_dt)].copy()
 
 if pred_f.empty:
     st.warning("No data in the selected date range.")
     st.stop()
 
-
-# ---------------------------
-# Main Layout
-# ---------------------------
+# Layout
 left, right = st.columns([2, 1])
 
 with left:
     st.subheader("Predicted traffic volume over time")
-
     st.metric("MAE", f"{mae:,.2f}")
     st.metric("RMSE", f"{rmse:,.2f}")
 
     n_points = st.slider("Number of points to display", 50, 500, 200, step=50)
-
     fig = lf.mdl_plt_streamlit(y_true, y_pred, n=n_points)
     st.pyplot(fig, clear_figure=True)
 
@@ -183,7 +222,6 @@ with right:
     st.metric("Min predicted volume", f"{pred_f[COL_PRED].min():,.0f}")
     st.metric("Max predicted volume", f"{pred_f[COL_PRED].max():,.0f}")
 
-
 st.divider()
 st.subheader("Lowest → Highest predicted timestamps (within selected range)")
 
@@ -196,11 +234,9 @@ highest = ranked.tail(top_n).sort_values(COL_PRED, ascending=False).copy()
 highest.insert(0, "Rank (highest)", range(1, len(highest) + 1))
 
 c1, c2 = st.columns(2)
-
 with c1:
     st.markdown("### Lowest")
     st.text(lowest.to_string(index=False))
-
 with c2:
     st.markdown("### Highest")
     st.text(highest.to_string(index=False))
