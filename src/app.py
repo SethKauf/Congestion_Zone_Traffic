@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import tensorflow as tf
 
+
 # -----------------------------------------------------------------------------
 # Paths / config
 # -----------------------------------------------------------------------------
@@ -27,13 +28,10 @@ st.set_page_config(
 # Helpers
 # -----------------------------------------------------------------------------
 def _find_artifact(filename: str) -> Path:
-    """
-    Find a file robustly on Streamlit Cloud by checking common locations
-    and finally falling back to a repo-wide rglob.
-    """
+    """Find file by checking common locations, then repo-wide search."""
     candidates = [
-        REPO_ROOT / filename,
-        HERE / filename,
+        REPO_ROOT / filename,      # repo root (your case)
+        HERE / filename,           # src/
         REPO_ROOT / "artifacts" / filename,
         REPO_ROOT / "models" / filename,
         REPO_ROOT / "assets" / filename,
@@ -41,42 +39,83 @@ def _find_artifact(filename: str) -> Path:
         HERE / "models" / filename,
         HERE / "assets" / filename,
     ]
-
     for p in candidates:
         if p.exists():
             return p
 
-    # last resort: search the repo (can be slower, but repo is usually small)
     hits = list(REPO_ROOT.rglob(filename))
     if hits:
         return hits[0]
 
-    # Not found: raise with a very explicit message
     raise FileNotFoundError(
-        f"Could not find '{filename}'.\n"
+        f"Could not find '{filename}'.\n\n"
         f"Checked:\n- " + "\n- ".join(str(c) for c in candidates) + "\n\n"
-        f"REPO_ROOT contents:\n"
+        f"Repo root ({REPO_ROOT}) contains:\n"
         + "\n".join(f"- {p.name}" for p in sorted(REPO_ROOT.iterdir()))
         + "\n\n"
-        f"SRC (HERE) contents:\n"
+        f"Src dir ({HERE}) contains:\n"
         + "\n".join(f"- {p.name}" for p in sorted(HERE.iterdir()))
     )
+
+
+def _peek_text(path: Path, n: int = 200) -> str:
+    """Read first n bytes as text (best-effort) for debugging."""
+    try:
+        b = path.read_bytes()[:n]
+        return b.decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"<could not read bytes: {type(e).__name__}: {e}>"
+
+
+def _is_git_lfs_pointer(path: Path) -> bool:
+    """Detect Git LFS pointer files (common Streamlit Cloud deploy gotcha)."""
+    head = _peek_text(path, 200)
+    return "git-lfs.github.com/spec" in head or head.strip().startswith("version https://git-lfs.github.com/spec")
 
 
 @st.cache_resource(show_spinner=True)
 def load_artifacts():
     """
     Load model + scaler once per server process.
-    Uses multiple fallbacks and prints helpful diagnostics on failure.
+    Includes strong diagnostics for Streamlit Cloud deployments.
     """
     model_path = _find_artifact("lstm_model.keras")
     scaler_path = _find_artifact("scaler.pkl")
 
-    # Helpful debug info (visible in app)
-    st.sidebar.caption("### Artifact paths (debug)")
-    st.sidebar.code(f"MODEL_PATH = {model_path}\nSCALER_PATH = {scaler_path}")
+    # Sidebar debug
+    with st.sidebar:
+        st.caption("### Artifact debug")
+        st.code(
+            "Resolved paths:\n"
+            f"MODEL  = {model_path}\n"
+            f"SCALER = {scaler_path}"
+        )
+        try:
+            st.write("Model size (bytes):", model_path.stat().st_size)
+        except Exception:
+            pass
+        try:
+            st.write("Scaler size (bytes):", scaler_path.stat().st_size)
+        except Exception:
+            pass
 
-    # Load scaler first (fast)
+        # LFS pointer check
+        if _is_git_lfs_pointer(model_path):
+            st.error("MODEL FILE LOOKS LIKE A GIT LFS POINTER (NOT THE REAL .keras FILE).")
+            st.code(_peek_text(model_path, 300))
+
+    # If the model is an LFS pointer, fail with a clear message
+    if _is_git_lfs_pointer(model_path):
+        raise RuntimeError(
+            "Your 'lstm_model.keras' appears to be a Git LFS pointer file in the deployed environment.\n\n"
+            "Fix:\n"
+            "- Ensure the REAL binary is committed (not LFS), OR\n"
+            "- Configure Streamlit Cloud to pull LFS objects (not always available), OR\n"
+            "- Store the model as a normal GitHub file under 100MB, OR\n"
+            "- Host the model elsewhere and download it at startup.\n"
+        )
+
+    # Load scaler (usually straightforward)
     try:
         scaler = joblib.load(scaler_path)
     except Exception as e:
@@ -86,39 +125,42 @@ def load_artifacts():
             f"Error: {type(e).__name__}: {e}"
         ) from e
 
-    # Load keras model (try both keras entrypoints)
-    keras_errors = []
-    for loader_name, loader_fn in [
-        ("tf.keras.models.load_model", tf.keras.models.load_model),
-        ("keras.saving.load_model", getattr(tf.keras, "keras", None).models.load_model if getattr(tf.keras, "keras", None) else None),
-    ]:
-        if loader_fn is None:
-            continue
+    # Load model (most compatible approach for TF/Keras in the cloud)
+    # - compile=False avoids requiring loss/optimizer objects
+    # - safe_mode=False helps if Keras 3 thinks something is unsafe to deserialize
+    try:
         try:
-            # compile=False avoids needing loss/optimizer objects
-            model = loader_fn(model_path, compile=False)
-            return model, scaler
-        except Exception as e:
-            keras_errors.append(f"{loader_name} -> {type(e).__name__}: {e}")
+            model = tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
+        except TypeError:
+            # older signature: safe_mode not supported
+            model = tf.keras.models.load_model(model_path, compile=False)
+    except Exception as e:
+        # show more diagnostics in sidebar
+        with st.sidebar:
+            st.caption("### Model load diagnostics")
+            st.code(_peek_text(model_path, 300))
 
-    raise RuntimeError(
-        "Failed to load Keras model.\n\n"
-        f"Path attempted: {model_path}\n\n"
-        "Most common causes:\n"
-        "- The .keras file is NOT actually in the deployed repo (committed locally but not pushed)\n"
-        "- The file is tracked by Git LFS but Streamlit Cloud didn’t pull LFS objects\n"
-        "- Version mismatch / custom objects required (less likely if compile=False)\n\n"
-        "Loader errors:\n- " + "\n- ".join(keras_errors)
-    )
+        raise RuntimeError(
+            "Failed to load Keras model from lstm_model.keras.\n\n"
+            f"Path: {model_path}\n"
+            f"Error: {type(e).__name__}: {e}\n\n"
+            "Common fixes:\n"
+            "1) Re-save the model in your training env with:\n"
+            "   model.save('lstm_model.keras', include_optimizer=False)\n"
+            "2) Ensure the file is NOT Git LFS pointer (must be real binary)\n"
+            "3) If you used custom layers/losses/metrics, pass custom_objects on load\n"
+        ) from e
+
+    return model, scaler
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 10)
 def get_predictions(last_n_days: int):
     """
     Returns:
-      pred_df_small: DataFrame with [toll_timestamp, traffic_volume_pred] for filtering/ranking
-      y_true: np.array of true values aligned to predictions (for diagnostic plot)
-      y_pred: np.array of predicted values (for diagnostic plot)
+      pred_df_small: DataFrame with [toll_timestamp, traffic_volume_pred]
+      y_true: np.array aligned to predictions
+      y_pred: np.array predictions
       mae, rmse: floats
     """
     raw = lf.load_last_n_days_brooklyn(n_days=last_n_days)
@@ -132,7 +174,7 @@ def get_predictions(last_n_days: int):
     pred_df_full[COL_TIMESTAMP] = pd.to_datetime(pred_df_full[COL_TIMESTAMP], errors="coerce")
 
     y_true = pred_df_full["traffic_volume_true"].to_numpy()
-    y_pred = pred_df_full["traffic_volume_pred"].to_numpy()
+    y_pred = pred_df_full[COL_PRED].to_numpy()
 
     pred_df_small = pred_df_full[[COL_TIMESTAMP, COL_PRED]].sort_values(COL_TIMESTAMP)
     return pred_df_small, y_true, y_pred, mae, rmse
@@ -140,10 +182,8 @@ def get_predictions(last_n_days: int):
 
 def _normalize_to_ny_naive(ts: pd.Series) -> pd.Series:
     ts = pd.to_datetime(ts, errors="coerce")
-    # tz-aware -> convert then drop tz
     if getattr(ts.dt, "tz", None) is not None:
         return ts.dt.tz_convert("America/New_York").dt.tz_localize(None)
-    # tz-naive -> assume UTC then convert to NY then drop tz
     return ts.dt.tz_localize("UTC").dt.tz_convert("America/New_York").dt.tz_localize(None)
 
 
@@ -169,17 +209,14 @@ with st.sidebar:
 with st.spinner("Loading data and generating predictions..."):
     pred, y_true, y_pred, mae, rmse = get_predictions(last_n_days)
 
-# Validate output
 needed = {COL_TIMESTAMP, COL_PRED}
 if not needed.issubset(pred.columns):
     st.error(f"Prediction output must include columns: {sorted(list(needed))}")
     st.stop()
 
-# Normalize timestamps to NY time (tz-naive for easy filtering)
 pred = pred.copy()
 pred[COL_TIMESTAMP] = _normalize_to_ny_naive(pred[COL_TIMESTAMP])
 
-# Filter by date range (inclusive)
 start_dt = pd.to_datetime(start_date)
 end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
 pred_f = pred[(pred[COL_TIMESTAMP] >= start_dt) & (pred[COL_TIMESTAMP] <= end_dt)].copy()
@@ -188,19 +225,16 @@ if pred_f.empty:
     st.warning("No data in the selected date range.")
     st.stop()
 
-# --- Main Layout ---
 left, right = st.columns([2, 1])
 
 with left:
     st.subheader("Predicted traffic volume over time")
-
     m1, m2 = st.columns(2)
     m1.metric("MAE", f"{mae:,.2f}")
     m2.metric("RMSE", f"{rmse:,.2f}")
 
     n_points = st.slider("Number of points to display", 50, 500, 200, step=50)
 
-    # Your helper should return a matplotlib figure
     fig = lf.mdl_plt_streamlit(y_true, y_pred, n=n_points)
     st.pyplot(fig, clear_figure=True)
 
@@ -230,7 +264,6 @@ highest = ranked.tail(top_n).sort_values(COL_PRED, ascending=False).copy()
 highest.insert(0, "Rank (highest)", range(1, len(highest) + 1))
 
 c1, c2 = st.columns(2)
-
 with c1:
     st.markdown("### Lowest")
     st.text(lowest.to_string(index=False))
